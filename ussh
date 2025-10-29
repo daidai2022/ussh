@@ -23,6 +23,7 @@ show_usage() {
     echo "  - Auto-accepts new SSH host keys"
     echo "  - Auto-removes changed host keys"
     echo "  - Tries multiple passwords if available"
+    echo "  - Reorders passwords to try successful ones first"
     echo "  - Supports both sshpass and expect"
     echo "  - Add new credentials with --add option"
     echo "  - Update credentials with --update option"
@@ -496,6 +497,39 @@ extract_user_host() {
     echo ""
 }
 
+# Function to move successful password to top of password file
+move_password_to_top() {
+    local user_host="$1"
+    local successful_password="$2"
+    local pw_file="$PASSWORD_FILE"
+    
+    # Check if password file exists
+    if [[ ! -f "$pw_file" ]]; then
+        return 1
+    fi
+    
+    # Create backup before modification
+    cp "$pw_file" "$pw_file.backup.$(date +%Y%m%d_%H%M%S)" 2>/dev/null || true
+    
+    # Create temporary file with successful password at top
+    local temp_file=$(mktemp)
+    
+    # Add the successful password entry first
+    echo "$user_host $successful_password" > "$temp_file"
+    
+    # Add all other entries for this user@host (except the successful one)
+    grep "^$user_host " "$pw_file" | grep -v "^$user_host $successful_password$" >> "$temp_file" 2>/dev/null || true
+    
+    # Add all entries for other user@host combinations
+    grep -v "^$user_host " "$pw_file" >> "$temp_file" 2>/dev/null || true
+    
+    # Replace original file with reordered content
+    mv "$temp_file" "$pw_file"
+    chmod 600 "$pw_file"
+    
+    echo "Moved successful password to top of password file for faster future access" >&2
+}
+
 # Function to get all passwords from password file for a user@host
 get_passwords() {
     local user_host="$1"
@@ -589,6 +623,59 @@ try_scp() {
     fi
 }
 
+# Function to test if a password works
+test_password() {
+    local password="$1"
+    local user_host="$2"
+    
+    # Test connection with a simple command that exits immediately
+    if command -v sshpass >/dev/null 2>&1; then
+        # Use sshpass to test the password with a simple command
+        sshpass -p "$password" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=10 -o BatchMode=no "$user_host" "exit 0" >/dev/null 2>&1
+        return $?
+    elif command -v expect >/dev/null 2>&1; then
+        expect -c "
+            set timeout 30
+            spawn ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=$HOME/.ssh/known_hosts -o ConnectTimeout=10 $user_host \"exit 0\"
+            expect {
+                \"*password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"*Password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no)?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no/\[fingerprint\])?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"*fingerprint*\" {
+                    send \"yes\r\"
+                    exp_continue
+                }
+                \"Warning: Permanently added*\" {
+                    exp_continue
+                }
+                eof {
+                    exit
+                }
+                timeout {
+                    exit 1
+                }
+            }
+        " >/dev/null 2>&1
+        return $?
+    else
+        echo "Error: Neither sshpass nor expect command is available" >&2
+        return 1
+    fi
+}
+
 # Function to try connecting with a password
 try_connect() {
     local password="$1"
@@ -649,6 +736,9 @@ try_connect() {
         return 1
     fi
 }
+
+# Global variable for password file path
+PASSWORD_FILE="$HOME/.ussh.pw"
 
 # Main logic
 main() {
@@ -768,35 +858,70 @@ main() {
     handle_host_key "$user_host"
     
     # Determine if this is scp or ssh command
+    local is_scp_command=false
     if [[ "$1" == "-c" ]]; then
         # scp command
+        is_scp_command=true
         shift
-        cmd_args=("scp" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "$@")
+        # For SCP, we need to replace the hostname in the arguments with user@host format
+        local scp_args=()
+        for arg in "$@"; do
+            if [[ "$arg" =~ ^[^@:]+: ]] && [[ ! "$arg" =~ ^[^@]+@.*: ]]; then
+                # This is a destination in format "hostname:" - convert to "user@hostname:"
+                local hostname="${arg%%:*}"
+                local path="${arg#*:}"
+                if [[ "$user_host" =~ ^(.*)@${hostname}$ ]]; then
+                    scp_args+=("${user_host}:${path}")
+                else
+                    scp_args+=("$arg")
+                fi
+            else
+                scp_args+=("$arg")
+            fi
+        done
+        cmd_args=("scp" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "${scp_args[@]}")
     else
-        # ssh command
-        cmd_args=("ssh" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "$@")
+        # ssh command - use the extracted user_host instead of original arguments
+        cmd_args=("ssh" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "$user_host")
     fi
     
     # Try each password until one succeeds
+    local working_password=""
+    
+    # First, find a working password
     while IFS= read -r password; do
         if [[ -n "$password" ]]; then
-            echo "Trying to connect to $user_host..." >&2
-            if [[ "$1" == "-c" ]]; then
-                # Use SCP-specific function
-                if try_scp "$password" "${cmd_args[@]}"; then
-                    exit 0
-                fi
-            else
-                # Use SSH-specific function
-                if try_connect "$password" "${cmd_args[@]}"; then
-                    exit 0
-                fi
+            echo "Testing password for $user_host..." >&2
+            if test_password "$password" "$user_host"; then
+                working_password="$password"
+                echo "Found working password for $user_host" >&2
+                break
             fi
         fi
     done <<< "$passwords"
     
-    echo "Error: All passwords failed for $user_host" >&2
-    exit 1
+    # Check if we found a working password
+    if [[ -z "$working_password" ]]; then
+        echo "Error: All passwords failed for $user_host" >&2
+        exit 1
+    fi
+    
+    # Move successful password to top for future use
+    move_password_to_top "$user_host" "$working_password"
+    
+    # Now establish the interactive connection
+    if [[ "$is_scp_command" == true ]]; then
+        # Use SCP-specific function
+        echo "Connecting via SCP..." >&2
+        try_scp "$working_password" "${cmd_args[@]}"
+        exit $?
+    else
+        # Use SSH-specific function for interactive session
+        echo "Establishing SSH connection..." >&2
+        try_connect "$working_password" "${cmd_args[@]}"
+        # When SSH session ends, script will exit
+        exit $?
+    fi
 }
 
 # Call main function with all arguments

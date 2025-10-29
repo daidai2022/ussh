@@ -1,0 +1,238 @@
+# USSH - Automated SSH Connection Tool
+
+A powerful Bash script that simplifies SSH connections and SCP file transfers by automatically handling passwords and host key management.
+
+## Features
+
+- 🔐 **Password Management**: Store and manage SSH passwords UN-securely
+- 🔑 **Auto Host Key Handling**: Automatically accepts new SSH host keys and removes changed ones
+- 🔄 **Multiple Password Support**: Try multiple passwords for the same host automatically
+- 📁 **SCP Support**: Easy file transfer with automatic authentication
+- 🛠️ **Tool Compatibility**: Works with both `sshpass` and `expect`
+- 🚀 **Easy Installation**: Install to system PATH or user directory
+- 👤 **Smart User Detection**: Defaults to root user for hostname-only connections
+- 🔒 **Secure Storage**: Password file with proper permissions (600)
+
+## Installation
+
+### System-wide Installation (Requires sudo)
+```bash
+./ussh --install
+```
+
+### User-local Installation
+```bash
+mkdir -p ~/.local/bin
+cp ussh ~/.local/bin/
+chmod +x ~/.local/bin/ussh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+```
+
+### Uninstallation
+```bash
+ussh --uninstall
+```
+
+## Dependencies
+
+The script requires one of the following tools for password automation:
+- `sshpass` (recommended) - Install with your package manager
+- `expect` - Alternative option if sshpass is not available
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install sshpass
+# or
+sudo apt-get install expect
+```
+
+**CentOS/RHEL/Fedora:**
+```bash
+sudo yum install sshpass
+# or
+sudo dnf install expect
+```
+
+## Usage
+
+### SSH Connections
+
+**Connect with username:**
+```bash
+ussh user@hostname
+```
+
+**Connect to hostname (defaults to root):**
+```bash
+ussh hostname
+```
+
+### File Transfer (SCP)
+
+**Transfer file with username:**
+```bash
+ussh -c source_file user@host:dest_file
+```
+
+**Transfer file to hostname (defaults to root):**
+```bash
+ussh -c source_file hostname:dest_file
+```
+
+### Password Management
+
+**Add a new password:**
+```bash
+ussh --add user@hostname "password123"
+```
+
+**Update/replace all passwords for a host:**
+```bash
+ussh --update user@hostname "newpassword"
+```
+
+**Delete all passwords for a host:**
+```bash
+ussh --delete user@hostname
+```
+
+**List all saved credentials:**
+```bash
+ussh --list
+```
+
+### Custom Password File
+
+**Use a different password file:**
+```bash
+ussh -f /path/to/custom.pw user@hostname
+ussh -f /path/to/custom.pw --add user@hostname "password"
+```
+
+## Password File Format
+
+The password file (`~/.ussh.pw` by default) uses a simple format:
+```
+user@host1 password1
+user@host2 password2
+root@server1 secretpass
+admin@server2 anotherpass
+```
+
+### File Security
+- Automatically created with `600` permissions (read/write for owner only)
+- Located at `~/.ussh.pw` by default
+- Supports custom file paths with `-f` option
+- Automatic backups created during modifications
+
+## Examples
+
+### Basic SSH Connection
+```bash
+# Add password for a server
+ussh --add admin@192.168.1.100 "mypassword"
+
+# Connect to the server
+ussh admin@192.168.1.100
+```
+
+### File Transfer
+```bash
+# Copy local file to remote server
+ussh -c /home/user/document.txt admin@192.168.1.100:/tmp/
+
+# Copy from remote to local
+ussh -c admin@192.168.1.100:/var/log/messages /tmp/logfile
+```
+
+### Multiple Passwords
+```bash
+# Add multiple passwords for the same host
+ussh --add root@server "oldpassword"
+ussh --add root@server "newpassword"
+
+# Script will try both passwords automatically
+ussh root@server
+```
+
+### Hostname-only Connections
+```bash
+# These are equivalent (both connect as root)
+ussh server.domain.com
+ussh root@server.domain.com
+```
+
+## Host Key Management
+
+The script automatically handles SSH host keys:
+
+- **New hosts**: Automatically accepts new host keys
+- **Changed keys**: Removes old keys when host keys change
+- **Known hosts**: Uses standard `~/.ssh/known_hosts` file
+- **Security**: Balances convenience with security for automated connections
+
+## Error Handling
+
+The script provides clear error messages for common issues:
+
+- Missing dependencies (sshpass/expect)
+- Invalid user@host format
+- File permission problems
+- Connection timeouts
+- Authentication failures
+
+## Security Considerations
+
+- Password files are created with restrictive permissions (600)
+- Automatic backups are created before modifications
+- Host key checking is relaxed for automation but still managed
+- Passwords are stored in plain text - consider your threat model
+- Use SSH keys for production environments when possible
+
+## Troubleshooting
+
+### Common Issues
+
+**"Neither sshpass nor expect command is available"**
+```bash
+# Install sshpass (recommended)
+sudo apt-get install sshpass  # Ubuntu/Debian
+sudo yum install sshpass      # CentOS/RHEL
+```
+
+**"Permission denied"**
+- Check if the password is correct
+- Verify the username exists on the target system
+- Ensure the target host allows password authentication
+
+**"Connection timeout"**
+- Verify the hostname/IP is reachable
+- Check if SSH service is running on the target host
+- Verify the correct port (default 22)
+
+**"Host key verification failed"**
+- The script should handle this automatically
+- If issues persist, manually remove the host from `~/.ssh/known_hosts`
+
+### Debug Mode
+For troubleshooting connections, you can run SSH manually with verbose output:
+```bash
+ssh -vvv user@hostname
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
+
+## License
+
+This script is provided as-is for educational and convenience purposes. Use at your own risk and ensure compliance with your organization's security policies.
+
+## Version History
+
+- Initial release: Full-featured SSH automation tool with password management
+- Features: SSH/SCP automation, password management, host key handling, installation system
+
+---
+
+**Note**: While this tool provides convenience for automated SSH connections, consider using SSH key-based authentication for production environments as it's more secure than password-based authentication.

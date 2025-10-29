@@ -1,0 +1,803 @@
+#!/bin/bash
+
+# Function to show usage information
+show_usage() {
+    echo "Usage:"
+    echo "  $0 user@host                              # SSH connection"
+    echo "  $0 hostname                               # SSH connection (defaults to root@hostname)"
+    echo "  $0 -c source_file user@host:dest_file     # SCP file transfer"
+    echo "  $0 -c source_file hostname:dest_file      # SCP file transfer (defaults to root@hostname)"
+    echo "  $0 --add user@host \"password\"           # Add password to ~/.ussh.pw"
+    echo "  $0 --update user@host \"password\"        # Update/replace all passwords for user@host"
+    echo "  $0 --delete user@host                     # Remove all passwords for user@host"
+    echo "  $0 --list                                 # List all saved user@host entries"
+    echo "  $0 -f <file_path> user@host               # Use custom password file"
+    echo "  $0 --install                              # Install script to /usr/sbin/"
+    echo "  $0 --uninstall                            # Uninstall script from system"
+    echo ""
+    echo "Password file format (~/.ussh.pw by default):"
+    echo "user@host1IP password1"
+    echo "user@host2IP password2"
+    echo ""
+    echo "Features:"
+    echo "  - Auto-accepts new SSH host keys"
+    echo "  - Auto-removes changed host keys"
+    echo "  - Tries multiple passwords if available"
+    echo "  - Supports both sshpass and expect"
+    echo "  - Add new credentials with --add option"
+    echo "  - Update credentials with --update option"
+    echo "  - Remove credentials with --delete option"
+    echo "  - List saved credentials with --list option"
+    echo "  - Custom password file with -f option"
+    echo "  - Install to system PATH with --install"
+    echo "  - Remove from system with --uninstall"
+    echo "  - Defaults to root user for hostname-only connections"
+}
+
+# Global variable for password file path
+PASSWORD_FILE="$HOME/.ussh.pw"
+
+# Function to update password for user@host (replace all existing passwords)
+update_password() {
+    local user_host="$1"
+    local password="$2"
+    local pw_file="$PASSWORD_FILE"
+    
+    # Validate arguments
+    if [[ -z "$user_host" ]] || [[ -z "$password" ]]; then
+        echo "Error: Both user@host and password are required for --update option" >&2
+        show_usage
+        exit 1
+    fi
+    
+    # Validate user@host format
+    if [[ ! "$user_host" =~ ^[^@]+@[^@]+$ ]]; then
+        echo "Error: Invalid user@host format. Expected: user@hostname" >&2
+        exit 1
+    fi
+    
+    # Create .ussh.pw file if it doesn't exist
+    if [[ ! -f "$pw_file" ]]; then
+        touch "$pw_file"
+        chmod 600 "$pw_file"  # Set secure permissions
+        echo "Created new password file: $pw_file"
+    fi
+    
+    # Check if entries exist for this user@host
+    local existing_entries=$(grep "^$user_host " "$pw_file" 2>/dev/null)
+    
+    if [[ -n "$existing_entries" ]]; then
+        # Entries exist - show what will be replaced
+        echo "Found existing entries for $user_host:"
+        echo "$existing_entries" | nl -w2 -s') '
+        echo ""
+        echo "Replacing all existing passwords with new password..."
+        
+        # Create backup before modification
+        cp "$pw_file" "$pw_file.backup.$(date +%Y%m%d_%H%M%S)"
+        echo "Created backup: $pw_file.backup.$(date +%Y%m%d_%H%M%S)"
+        
+        # Remove old entries and add new one
+        grep -v "^$user_host " "$pw_file" > "$pw_file.tmp" || true
+        echo "$user_host $password" >> "$pw_file.tmp"
+        mv "$pw_file.tmp" "$pw_file"
+        
+        echo "Successfully updated password for $user_host"
+    else
+        # No existing entries - add new one
+        echo "No existing entries found for $user_host"
+        echo "Adding new password entry..."
+        
+        echo "$user_host $password" >> "$pw_file"
+        echo "Successfully added new password for $user_host"
+    fi
+    
+    # Show final result
+    echo ""
+    echo "Current entry for $user_host:"
+    local final_entry=$(grep "^$user_host " "$pw_file" 2>/dev/null)
+    if [[ -n "$final_entry" ]]; then
+        echo " 1) $final_entry"
+    else
+        echo "  (no entries found - this shouldn't happen)"
+    fi
+}
+
+# Function to list all saved user@host entries
+list_entries() {
+    local pw_file="$PASSWORD_FILE"
+    
+    echo "Listing saved user@host entries from: $pw_file"
+    echo ""
+    
+    # Check if password file exists
+    if [[ ! -f "$pw_file" ]]; then
+        echo "No password file found at: $pw_file"
+        echo "Use --add to create entries"
+        exit 0
+    fi
+    
+    # Check if file is empty
+    if [[ ! -s "$pw_file" ]]; then
+        echo "Password file is empty: $pw_file"
+        echo "Use --add to create entries"
+        exit 0
+    fi
+    
+    # Read and process entries
+    local unique_hosts=()
+    local entry_count=0
+    local total_entries=0
+    
+    echo "Saved credentials:"
+    echo "=================="
+    
+    # First pass: get unique hosts and count total entries
+    while IFS=' ' read -r host_entry pass_entry || [[ -n "$host_entry" ]]; do
+        # Skip empty lines and comments
+        [[ -z "$host_entry" || "$host_entry" =~ ^[[:space:]]*# ]] && continue
+        
+        ((total_entries++))
+        
+        # Check if this host is already in our unique list
+        local found=false
+        for existing_host in "${unique_hosts[@]}"; do
+            if [[ "$existing_host" == "$host_entry" ]]; then
+                found=true
+                break
+            fi
+        done
+        
+        if [[ "$found" == false ]]; then
+            unique_hosts+=("$host_entry")
+        fi
+    done < "$pw_file"
+    
+    # Second pass: display entries grouped by host
+    for host in "${unique_hosts[@]}"; do
+        ((entry_count++))
+        local passwords=$(grep "^$host " "$pw_file" | cut -d' ' -f2-)
+        local password_count=$(echo "$passwords" | wc -l)
+        
+        printf "%2d. %s" "$entry_count" "$host"
+        
+        if [[ $password_count -gt 1 ]]; then
+            echo " ($password_count passwords)"
+            echo "$passwords" | nl -w4 -s') ' | sed 's/^/    /'
+        else
+            echo " (1 password)"
+            echo "     1) $passwords"
+        fi
+        echo ""
+    done
+    
+    echo "Summary:"
+    echo "--------"
+    echo "Unique hosts: ${#unique_hosts[@]}"
+    echo "Total entries: $total_entries"
+    echo "Password file: $pw_file"
+}
+
+# Function to uninstall script from system
+uninstall_script() {
+    local script_name="$(basename "$0")"
+    local system_path="/usr/sbin/$script_name"
+    local user_path="$HOME/.local/bin/$script_name"
+    local found_installations=()
+    
+    echo "Searching for installed versions of $script_name..."
+    
+    # Check for system installation
+    if [[ -f "$system_path" ]]; then
+        found_installations+=("system:$system_path")
+        echo "Found system installation: $system_path"
+    fi
+    
+    # Check for user installation
+    if [[ -f "$user_path" ]]; then
+        found_installations+=("user:$user_path")
+        echo "Found user installation: $user_path"
+    fi
+    
+    # Check if any installations were found
+    if [[ ${#found_installations[@]} -eq 0 ]]; then
+        echo "No installed versions of $script_name found."
+        echo "Checked locations:"
+        echo "  - $system_path (system-wide)"
+        echo "  - $user_path (user-local)"
+        exit 0
+    fi
+    
+    echo ""
+    echo "Found ${#found_installations[@]} installation(s):"
+    
+    # Process each installation
+    for installation in "${found_installations[@]}"; do
+        local type="${installation%%:*}"
+        local path="${installation#*:}"
+        
+        echo ""
+        echo "Removing $type installation: $path"
+        
+        if [[ "$type" == "system" ]]; then
+            # System installation requires sudo
+            if ! command -v sudo >/dev/null 2>&1; then
+                echo "Warning: sudo command not found"
+                echo "To remove system installation manually, run as root:"
+                echo "  rm \"$path\""
+                continue
+            fi
+            
+            # Check sudo permissions
+            if ! sudo -n true 2>/dev/null; then
+                echo "Checking sudo permissions..."
+                if ! sudo -v; then
+                    echo "Error: sudo permissions required to remove system installation" >&2
+                    echo "To remove manually, run as root: rm \"$path\""
+                    continue
+                fi
+            fi
+            
+            # Create backup before removal
+            if sudo cp "$path" "$path.removed.$(date +%Y%m%d_%H%M%S)" 2>/dev/null; then
+                echo "Created backup: $path.removed.$(date +%Y%m%d_%H%M%S)"
+            fi
+            
+            # Remove system installation
+            if sudo rm "$path"; then
+                echo "Successfully removed system installation: $path"
+            else
+                echo "Error: Failed to remove system installation: $path" >&2
+            fi
+            
+        elif [[ "$type" == "user" ]]; then
+            # User installation - direct removal
+            # Create backup before removal
+            if cp "$path" "$path.removed.$(date +%Y%m%d_%H%M%S)" 2>/dev/null; then
+                echo "Created backup: $path.removed.$(date +%Y%m%d_%H%M%S)"
+            fi
+            
+            # Remove user installation
+            if rm "$path"; then
+                echo "Successfully removed user installation: $path"
+            else
+                echo "Error: Failed to remove user installation: $path" >&2
+            fi
+        fi
+    done
+    
+    echo ""
+    echo "Uninstallation completed."
+    echo "Note: This will not affect any saved password files (~/.ussh.pw)"
+}
+
+# Function to install script to system path
+install_script() {
+    local script_path="$(readlink -f "$0")"
+    local script_name="$(basename "$0")"
+    local install_path="/usr/sbin/$script_name"
+    local user_bin_path="$HOME/.local/bin/$script_name"
+    
+    echo "Installing $script_name..."
+    
+    # Check if sudo is available
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "Warning: sudo command not found"
+        echo "Attempting user-local installation instead..."
+        
+        # Create user bin directory if it doesn't exist
+        mkdir -p "$HOME/.local/bin"
+        
+        # Copy to user's local bin
+        if cp "$script_path" "$user_bin_path"; then
+            chmod +x "$user_bin_path"
+            echo "Successfully installed $script_name to $user_bin_path"
+            
+            # Check if ~/.local/bin is in PATH
+            if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                echo ""
+                echo "NOTE: $HOME/.local/bin is not in your PATH"
+                echo "Add the following line to your ~/.bashrc or ~/.profile:"
+                echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
+                echo ""
+                echo "Or run this command now:"
+                echo "echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc"
+            else
+                echo "User installation verified: '$script_name' should be available in PATH"
+            fi
+            
+            exit 0
+        else
+            echo "Error: Failed to install to user directory" >&2
+            exit 1
+        fi
+    fi
+    
+    echo "Installing to system directory: $install_path"
+    
+    # Check if we have sudo permissions
+    if ! sudo -n true 2>/dev/null; then
+        echo "Checking sudo permissions..."
+        if ! sudo -v; then
+            echo "Error: sudo permissions required to install to /usr/sbin/" >&2
+            echo ""
+            echo "Alternative: Install to user directory with:"
+            echo "  mkdir -p ~/.local/bin"
+            echo "  cp \"$script_path\" ~/.local/bin/$script_name"
+            echo "  chmod +x ~/.local/bin/$script_name"
+            exit 1
+        fi
+    fi
+    
+    # Check if target directory exists
+    if [[ ! -d "/usr/sbin" ]]; then
+        echo "Error: /usr/sbin directory does not exist" >&2
+        exit 1
+    fi
+    
+    # Check if file already exists
+    if [[ -f "$install_path" ]]; then
+        echo "File $install_path already exists."
+        read -p "Do you want to overwrite it? (y/N): " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "Installation cancelled."
+            exit 0
+        fi
+        
+        # Create backup of existing file
+        sudo cp "$install_path" "$install_path.backup.$(date +%Y%m%d_%H%M%S)"
+        echo "Created backup: $install_path.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+    
+    # Copy the script
+    if sudo cp "$script_path" "$install_path"; then
+        # Set proper permissions
+        sudo chmod 755 "$install_path"
+        sudo chown root:root "$install_path"
+        
+        echo "Successfully installed $script_name to $install_path"
+        echo "You can now run '$script_name' from anywhere in the system"
+        
+        # Verify installation
+        if command -v "$script_name" >/dev/null 2>&1; then
+            echo "Installation verified: '$script_name' is now in PATH"
+        else
+            echo "Note: You may need to restart your shell or run 'hash -r' to update PATH"
+        fi
+    else
+        echo "Error: Failed to copy script to $install_path" >&2
+        exit 1
+    fi
+}
+
+# Function to delete passwords from password file
+delete_passwords() {
+    local user_host="$1"
+    local pw_file="$PASSWORD_FILE"
+    
+    # Validate arguments
+    if [[ -z "$user_host" ]]; then
+        echo "Error: user@host is required for --delete option" >&2
+        show_usage
+        exit 1
+    fi
+    
+    # Validate user@host format
+    if [[ ! "$user_host" =~ ^[^@]+@[^@]+$ ]]; then
+        echo "Error: Invalid user@host format. Expected: user@hostname" >&2
+        exit 1
+    fi
+    
+    # Check if password file exists
+    if [[ ! -f "$pw_file" ]]; then
+        echo "Error: Password file $pw_file not found" >&2
+        exit 1
+    fi
+    
+    # Check if entries exist for this user@host
+    local entries=$(grep "^$user_host " "$pw_file" 2>/dev/null)
+    if [[ -z "$entries" ]]; then
+        echo "No entries found for $user_host in $pw_file"
+        exit 0
+    fi
+    
+    # Show entries that will be deleted
+    echo "Found entries for $user_host:"
+    echo "$entries" | nl -w2 -s') '
+    
+    # Create backup of original file
+    cp "$pw_file" "$pw_file.backup.$(date +%Y%m%d_%H%M%S)"
+    echo "Created backup: $pw_file.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    # Remove entries for the specified user@host
+    grep -v "^$user_host " "$pw_file" > "$pw_file.tmp" || true
+    if [[ $? -eq 0 ]] || [[ ! -s "$pw_file.tmp" ]]; then
+        mv "$pw_file.tmp" "$pw_file"
+        echo "Successfully removed all entries for $user_host"
+        
+        # Show remaining entries count
+        local remaining=$(wc -l < "$pw_file" 2>/dev/null || echo "0")
+        echo "Remaining entries in $pw_file: $remaining"
+    else
+        echo "Error: Failed to remove entries" >&2
+        rm -f "$pw_file.tmp"
+        exit 1
+    fi
+}
+
+# Function to add password to password file
+add_password() {
+    local user_host="$1"
+    local password="$2"
+    local pw_file="$PASSWORD_FILE"
+    
+    # Validate arguments
+    if [[ -z "$user_host" ]] || [[ -z "$password" ]]; then
+        echo "Error: Both user@host and password are required for --add option" >&2
+        show_usage
+        exit 1
+    fi
+    
+    # Validate user@host format
+    if [[ ! "$user_host" =~ ^[^@]+@[^@]+$ ]]; then
+        echo "Error: Invalid user@host format. Expected: user@hostname" >&2
+        exit 1
+    fi
+    
+    # Create .ussh.pw file if it doesn't exist
+    if [[ ! -f "$pw_file" ]]; then
+        touch "$pw_file"
+        chmod 600 "$pw_file"  # Set secure permissions
+        echo "Created new password file: $pw_file"
+    fi
+    
+    # Check if entry already exists
+    if grep -q "^$user_host " "$pw_file" 2>/dev/null; then
+        echo "Entry for $user_host already exists. Adding as additional password..."
+    fi
+    
+    # Add the new entry
+    echo "$user_host $password" >> "$pw_file"
+    echo "Added password entry for $user_host to $pw_file"
+    
+    # Show current entries for this host
+    echo "Current entries for $user_host:"
+    local entries=$(grep "^$user_host " "$pw_file" 2>/dev/null)
+    if [[ -n "$entries" ]]; then
+        echo "$entries" | nl -w2 -s') '
+    else
+        echo "  (no entries found)"
+    fi
+}
+
+# Function to extract user@host from command line arguments
+extract_user_host() {
+    local args=("$@")
+    for arg in "${args[@]}"; do
+        if [[ "$arg" =~ ^[^@]+@[^:]+(:.*)?$ ]]; then
+            # Found user@host format
+            echo "${arg%%:*}"
+            return
+        elif [[ "$arg" =~ ^[^@:]+(:.*)?$ ]] && [[ ! "$arg" =~ ^-.*$ ]]; then
+            # Found hostname without user, check if it looks like a host (not an option)
+            # Skip if it's an option starting with - or if it's a file path for SCP
+            local host_part="${arg%%:*}"
+            # Basic hostname validation (contains dots, or looks like IP, or is a simple name)
+            if [[ "$host_part" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || 
+               [[ "$host_part" =~ \. ]] || 
+               [[ "$host_part" =~ ^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]*$ ]]; then
+                # Valid hostname found, prepend with root@
+                echo "root@${arg%%:*}"
+                return
+            fi
+        fi
+    done
+    echo ""
+}
+
+# Function to get all passwords from password file for a user@host
+get_passwords() {
+    local user_host="$1"
+    local pw_file="$PASSWORD_FILE"
+    
+    if [[ ! -f "$pw_file" ]]; then
+        echo "Error: Password file $pw_file not found" >&2
+        exit 1
+    fi
+    
+    # Get all matching passwords for the user@host
+    grep "^$user_host " "$pw_file" | cut -d' ' -f2-
+}
+
+# Function to handle SSH host key management
+handle_host_key() {
+    local user_host="$1"
+    local host_ip=$(echo "$user_host" | cut -d'@' -f2)
+    local known_hosts="$HOME/.ssh/known_hosts"
+    
+    # Create .ssh directory if it doesn't exist
+    mkdir -p "$HOME/.ssh"
+    touch "$known_hosts"
+    
+    # Check if host key exists and is valid
+    if ssh-keygen -F "$host_ip" -f "$known_hosts" >/dev/null 2>&1; then
+        # Host exists, try a quick connection to check if key is still valid
+        if ! ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes "$user_host" exit 2>/dev/null; then
+            # Key mismatch or connection failed, remove old key
+            echo "Host key changed for $host_ip, removing old key..." >&2
+            ssh-keygen -R "$host_ip" -f "$known_hosts" >/dev/null 2>&1
+        fi
+    fi
+}
+
+# Function to try SCP with a password
+try_scp() {
+    local password="$1"
+    shift
+    local cmd_args=("$@")
+    
+    # Check available tools and execute
+    if command -v sshpass >/dev/null 2>&1; then
+        # Use sshpass with relaxed host key checking for SCP
+        sshpass -p "$password" "${cmd_args[@]}"
+        return $?
+    elif command -v expect >/dev/null 2>&1; then
+        expect -c "
+            set timeout 30
+            spawn ${cmd_args[*]}
+            expect {
+                \"*password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"*Password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no)?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no/\[fingerprint\])?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"*fingerprint*\" {
+                    send \"yes\r\"
+                    exp_continue
+                }
+                \"Warning: Permanently added*\" {
+                    exp_continue
+                }
+                \"100%\" {
+                    exp_continue
+                }
+                eof {
+                    exit
+                }
+                timeout {
+                    puts \"SCP timeout\"
+                    exit 1
+                }
+            }
+        "
+        return $?
+    else
+        echo "Error: Neither sshpass nor expect command is available" >&2
+        return 1
+    fi
+}
+
+# Function to try connecting with a password
+try_connect() {
+    local password="$1"
+    shift
+    local cmd_args=("$@")
+    
+    # Check available tools and execute
+    if command -v sshpass >/dev/null 2>&1; then
+        # Use sshpass with the complete command
+        sshpass -p "$password" "${cmd_args[@]}"
+        return $?
+    elif command -v expect >/dev/null 2>&1; then
+        expect -c "
+            set timeout 30
+            spawn ${cmd_args[*]}
+            expect {
+                \"*password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"*Password:\" { 
+                    send \"$password\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no)?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"Are you sure you want to continue connecting (yes/no/\[fingerprint\])?\" { 
+                    send \"yes\r\"
+                    exp_continue 
+                }
+                \"*fingerprint*\" {
+                    send \"yes\r\"
+                    exp_continue
+                }
+                \"Warning: Permanently added*\" {
+                    exp_continue
+                }
+                \"*$ \" {
+                    interact
+                }
+                \"*# \" {
+                    interact
+                }
+                eof {
+                    exit
+                }
+                timeout {
+                    puts \"Connection timeout\"
+                    exit 1
+                }
+            }
+        "
+        return $?
+    else
+        echo "Error: Neither sshpass nor expect command is available" >&2
+        return 1
+    fi
+}
+
+# Main logic
+main() {
+    local user_host
+    local passwords
+    local cmd_args=("$@")
+    
+    # Check for help options or no arguments
+    if [[ $# -eq 0 ]] || [[ "$1" == "-h" ]] || [[ "$1" == "--help" ]]; then
+        show_usage
+        exit 0
+    fi
+    
+    # Handle -f option for custom password file
+    if [[ "$1" == "-f" ]]; then
+        if [[ $# -lt 2 ]]; then
+            echo "Error: -f option requires a file path" >&2
+            show_usage
+            exit 1
+        fi
+        PASSWORD_FILE="$2"
+        shift 2  # Remove -f and file path from arguments
+        cmd_args=("$@")  # Update cmd_args after removing -f options
+        
+        # Check if we still have arguments after -f
+        if [[ $# -eq 0 ]]; then
+            echo "Error: No command specified after -f option" >&2
+            show_usage
+            exit 1
+        fi
+    fi
+    
+    # Handle --list option
+    if [[ "$1" == "--list" ]]; then
+        if [[ $# -ne 1 ]]; then
+            echo "Error: --list option does not take any arguments" >&2
+            show_usage
+            exit 1
+        fi
+        list_entries
+        exit 0
+    fi
+    
+    # Handle --uninstall option
+    if [[ "$1" == "--uninstall" ]]; then
+        if [[ $# -ne 1 ]]; then
+            echo "Error: --uninstall option does not take any arguments" >&2
+            show_usage
+            exit 1
+        fi
+        uninstall_script
+        exit 0
+    fi
+    
+    # Handle --install option
+    if [[ "$1" == "--install" ]]; then
+        if [[ $# -ne 1 ]]; then
+            echo "Error: --install option does not take any arguments" >&2
+            show_usage
+            exit 1
+        fi
+        install_script
+        exit 0
+    fi
+    
+    # Handle --update option (after -f processing)
+    if [[ "$1" == "--update" ]]; then
+        if [[ $# -ne 3 ]]; then
+            echo "Error: --update option requires exactly 2 arguments: user@host and password" >&2
+            show_usage
+            exit 1
+        fi
+        update_password "$2" "$3"
+        exit 0
+    fi
+    
+    # Handle --add option (after -f processing)
+    if [[ "$1" == "--add" ]]; then
+        if [[ $# -ne 3 ]]; then
+            echo "Error: --add option requires exactly 2 arguments: user@host and password" >&2
+            show_usage
+            exit 1
+        fi
+        add_password "$2" "$3"
+        exit 0
+    fi
+    
+    # Handle --delete option (after -f processing)
+    if [[ "$1" == "--delete" ]]; then
+        if [[ $# -ne 2 ]]; then
+            echo "Error: --delete option requires exactly 1 argument: user@host" >&2
+            show_usage
+            exit 1
+        fi
+        delete_passwords "$2"
+        exit 0
+    fi
+    
+    # Extract user@host from arguments
+    user_host=$(extract_user_host "$@")
+    
+    if [[ -z "$user_host" ]]; then
+        echo "Error: Could not find user@host in arguments" >&2
+        show_usage
+        exit 1
+    fi
+    
+    # Get all passwords for user@host
+    passwords=$(get_passwords "$user_host")
+    
+    if [[ -z "$passwords" ]]; then
+        echo "Error: Password not found for $user_host" >&2
+        exit 1
+    fi
+    
+    # Handle SSH host key management
+    handle_host_key "$user_host"
+    
+    # Determine if this is scp or ssh command
+    if [[ "$1" == "-c" ]]; then
+        # scp command
+        shift
+        cmd_args=("scp" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "$@")
+    else
+        # ssh command
+        cmd_args=("ssh" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "$@")
+    fi
+    
+    # Try each password until one succeeds
+    while IFS= read -r password; do
+        if [[ -n "$password" ]]; then
+            echo "Trying to connect to $user_host..." >&2
+            if [[ "$1" == "-c" ]]; then
+                # Use SCP-specific function
+                if try_scp "$password" "${cmd_args[@]}"; then
+                    exit 0
+                fi
+            else
+                # Use SSH-specific function
+                if try_connect "$password" "${cmd_args[@]}"; then
+                    exit 0
+                fi
+            fi
+        fi
+    done <<< "$passwords"
+    
+    echo "Error: All passwords failed for $user_host" >&2
+    exit 1
+}
+
+# Call main function with all arguments
+main "$@"

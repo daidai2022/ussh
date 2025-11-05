@@ -5,8 +5,10 @@ show_usage() {
     echo "Usage:"
     echo "  $0 user@host                              # SSH connection"
     echo "  $0 hostname                               # SSH connection (defaults to root@hostname)"
-    echo "  $0 -c source_file user@host:dest_file     # SCP file transfer"
-    echo "  $0 -c source_file hostname:dest_file      # SCP file transfer (defaults to root@hostname)"
+    echo "  $0 -c source_file user@host:dest_file     # SCP file transfer (local to remote)"
+    echo "  $0 -c source_file hostname:dest_file      # SCP file transfer (local to remote, defaults to root@hostname)"
+    echo "  $0 -cb user@host:source_file dest_file    # SCP file transfer (remote to local)"
+    echo "  $0 -cb hostname:source_file dest_file     # SCP file transfer (remote to local, defaults to root@hostname)"
     echo "  $0 --add user@host \"password\"           # Add password to ~/.ussh.pw"
     echo "  $0 --update user@host \"password\"        # Update/replace all passwords for user@host"
     echo "  $0 --delete user@host                     # Remove all passwords for user@host"
@@ -860,7 +862,7 @@ main() {
     # Determine if this is scp or ssh command
     local is_scp_command=false
     if [[ "$1" == "-c" ]]; then
-        # scp command
+        # scp command (local to remote)
         is_scp_command=true
         shift
         # For SCP, we need to replace the hostname in the arguments with user@host format
@@ -868,6 +870,27 @@ main() {
         for arg in "$@"; do
             if [[ "$arg" =~ ^[^@:]+: ]] && [[ ! "$arg" =~ ^[^@]+@.*: ]]; then
                 # This is a destination in format "hostname:" - convert to "user@hostname:"
+                local hostname="${arg%%:*}"
+                local path="${arg#*:}"
+                if [[ "$user_host" =~ ^(.*)@${hostname}$ ]]; then
+                    scp_args+=("${user_host}:${path}")
+                else
+                    scp_args+=("$arg")
+                fi
+            else
+                scp_args+=("$arg")
+            fi
+        done
+        cmd_args=("scp" "-o" "StrictHostKeyChecking=no" "-o" "UserKnownHostsFile=$HOME/.ssh/known_hosts" "${scp_args[@]}")
+    elif [[ "$1" == "-cb" ]]; then
+        # scp command (remote to local)
+        is_scp_command=true
+        shift
+        # For SCP -cb, we need to replace the hostname in the source argument with user@host format
+        local scp_args=()
+        for arg in "$@"; do
+            if [[ "$arg" =~ ^[^@:]+: ]] && [[ ! "$arg" =~ ^[^@]+@.*: ]]; then
+                # This is a source in format "hostname:" - convert to "user@hostname:"
                 local hostname="${arg%%:*}"
                 local path="${arg#*:}"
                 if [[ "$user_host" =~ ^(.*)@${hostname}$ ]]; then
